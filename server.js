@@ -10,7 +10,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // REQUIRED (project-scoped, 
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
 const VOICE          = process.env.VOICE || "verse";
 
-// Persona / instructions
+// ──────────── Persona ────────────
 const INSTRUCTIONS = `
 You are **Zander** from **MachineTrade**, calling on behalf of **Martin** at **MJ Woodworking**.
 Purpose: Martin is flat-out today; you're gathering quick details and answering immediate questions.
@@ -54,7 +54,6 @@ const bytesToB64 = bytes => Buffer.from(bytes).toString("base64");
 // ──────────── HTTP (serves TwiML) ────────────
 const server = http.createServer((req, res) => {
   if (req.url.startsWith("/twiml")) {
-    // IMPORTANT: text/xml + both_tracks so we can send audio back
     res.writeHead(200, { "content-type": "text/xml" });
     const host = req.headers.host;
     res.end(`
@@ -66,7 +65,7 @@ const server = http.createServer((req, res) => {
 </Response>`.trim());
     return;
   }
-  // Simple health check
+
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK");
 });
@@ -82,6 +81,7 @@ server.on("upgrade", (req, socket, head) => {
 });
 server.listen(PORT, () => console.log(`Bridge listening on :${PORT}`));
 
+// ──────────── Helpers ────────────
 async function connectOpenAI() {
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
   const headers = {
@@ -95,14 +95,14 @@ async function connectOpenAI() {
   });
 }
 
+// ──────────── Core bridge ────────────
 function handleTwilio(wsTwilio) {
   console.log("Twilio stream connected");
   let streamSid = null;
   let openaiWS = null;
   let open = true;
-
-  let framesSinceCommit = 0;           // commit roughly every ~100 ms (5 * 20 ms)
-  const COMMIT_EVERY_FRAMES = 5;
+  let framesSinceCommit = 0;
+  const COMMIT_EVERY_FRAMES = 20; // ~400ms
   let keepaliveTimer = null;
 
   function sendToTwilio(mutlaw) {
@@ -125,36 +125,41 @@ function handleTwilio(wsTwilio) {
       streamSid = data.start.streamSid;
       console.log("Twilio start", streamSid, "tracks:", data.start.tracks);
 
-      // Connect to OpenAI Realtime
       openaiWS = await connectOpenAI();
 
-      // Keepalive (avoid idle closes)
+      // Keepalive
       keepaliveTimer = setInterval(() => {
         try { openaiWS?.ping?.(); } catch {}
         try { wsTwilio?.send(JSON.stringify({ event: "mark", streamSid, name: "tick" })); } catch {}
       }, 15000);
 
-      // Handle ALL messages from OpenAI
+      // Handle OpenAI messages
       openaiWS.on("message", (raw) => {
         let pkt; try { pkt = JSON.parse(raw.toString("utf8")); } catch { return; }
 
-        // 🔎 print full error payloads
         if (pkt.type === "error" || pkt.type?.endsWith?.(".error")) {
           console.log("OpenAI ERROR:", JSON.stringify(pkt, null, 2));
           return;
         }
 
+        // 🗣 transcripts
+        if (pkt.type === "response.output_text.delta" && pkt.delta) {
+          console.log("🗣 Zander:", pkt.delta);
+        }
+        if (pkt.type === "input_text" && pkt.text) {
+          console.log("👤 Caller:", pkt.text);
+        }
+
+        // audio deltas
         if (pkt.type === "output_audio.delta" && pkt.delta) {
           const b = Buffer.from(pkt.delta, "base64");
           const pcm16_16k = new Int16Array(b.buffer, b.byteOffset, b.byteLength / 2);
           const pcm16_8k  = linearResamplePCM16(pcm16_16k, 16000, 8000);
           const ulaw8k    = pcm16ToMuLaw(pcm16_8k);
           sendToTwilio(ulaw8k);
-          // console.log(`OpenAI → audio delta: ${ulaw8k.length} ulaw samples`);
           return;
         }
 
-        // Helpful to see flow (response.created, response.output_text.delta, etc.)
         console.log("OpenAI msg:", pkt.type);
       });
 
@@ -166,43 +171,49 @@ function handleTwilio(wsTwilio) {
         session: { voice: VOICE, instructions: INSTRUCTIONS }
       }));
 
-      // Small delay helps some hosts avoid immediate stop before first audio frame
+      // Small delay before first greeting
       setTimeout(() => {
         console.log("Sending initial greeting...");
         openaiWS.send(JSON.stringify({
           type: "response.create",
-          response: { modalities: ["audio"], instructions: "Hi, it's Zander from MachineTrade calling for Martin at MJ Woodworking. Is now a quick time?" }
+          response: {
+            modalities: ["audio", "text"],
+            instructions: "Hi, it's Zander from MachineTrade calling for Martin at MJ Woodworking. Is now a quick time?"
+          }
         }));
-      }, 100); // 100ms
+      }, 200);
     }
 
-    // Caller audio from Twilio (8 kHz μ-law)
+    // Incoming caller audio
     if (event === "media" && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
       const ulawBytes = b64ToBytes(data.media.payload);
       const pcm16_8k  = muLawToPCM16(ulawBytes);
       const pcm16_16k = linearResamplePCM16(pcm16_8k, 8000, 16000);
 
-      // ✅ encode only the Int16 view (avoid base64 length errors)
       const viewBuf = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength);
       openaiWS.send(JSON.stringify({
         type: "input_audio_buffer.append",
         audio: bytesToB64(viewBuf)
       }));
-      framesSinceCommit++;
 
-      // Commit periodically so the model reacts quickly
+      framesSinceCommit++;
       if (framesSinceCommit >= COMMIT_EVERY_FRAMES) {
-        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] }}));
         framesSinceCommit = 0;
+        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        openaiWS.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
       }
     }
 
-    // End/DTMF: force a commit
     if (event === "stop" || event === "dtmf") {
       if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
         openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] }}));
+        openaiWS.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
       }
       if (event === "stop") {
         console.log("Twilio stop");
