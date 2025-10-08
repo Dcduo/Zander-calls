@@ -106,7 +106,7 @@ function handleTwilio(wsTwilio){
 
       // Start a “silence pump” so Twilio doesn't hang up before first audio
       if (!silencePump) {
-        silencePump = setInterval(()=> sendToTwilio(ULAW_SILENCE_20MS), 40); // ~25 fps
+        silencePump = setInterval(()=> sW_SILENCE_20MS), 40); // ~25 fps
       }
 
       // Handle OpenAI messages
@@ -132,6 +132,7 @@ function handleTwilio(wsTwilio){
           const pcm16_16k = new Int16Array(b.buffer, b.byteOffset, b.byteLength/2);
           const pcm16_8k  = linearResamplePCM16(pcm16_16k, 16000, 8000);
           const ulaw      = pcm16ToMuLaw(pcm16_8k);
+          console.log("🎧 Sending audio to Twilio", ulaw.length);
           sendToTwilio(ulaw);
         }
       });
@@ -174,4 +175,5 @@ function handleTwilio(wsTwilio){
     try { openaiWS?.close(); } catch {}
   });
 }
+
 
