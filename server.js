@@ -21,7 +21,7 @@ End with a clear next step (you'll pass info to Martin or arrange callback).
 const MULAW_MAX=0x1FFF,SIGN_BIT=0x80,QUANT_MASK=0x0F,SEG_SHIFT=4,SEG_MASK=0x70;
 function ulawDecode(s){s=~s&255;let t=((s&QUANT_MASK)<<3)+132;t<<=((s&SEG_MASK)>>SEG_SHIFT);return(s&SIGN_BIT)?(132-t):(t-132);}
 function muLawToPCM16(b){const o=new Int16Array(b.length);for(let i=0;i<b.length;i++)o[i]=ulawDecode(b[i]);return o;}
-function linearResamplePCM16(a,fi,fo){if(fi===fo)return a;const r=fo/fi,o=new Int16Array(Math.floor(a.length*r));for(let i=0;i<i<o.length;i++){const s=i/r,i0=Math.floor(s),i1=Math.min(i0+1,a.length-1),f=s-i0;o[i]=(a[i0]*(1-f)+a[i1]*f)|0;}return o;}
+function linearResamplePCM16(a,fi,fo){if(fi===fo)return a;const r=fo/fi,o=new Int16Array(Math.floor(a.length*r));for(let i=0;i<o.length;i++){const s=i/r,i0=Math.floor(s),i1=Math.min(i0+1,a.length-1),f=s-i0;o[i]=(a[i0]*(1-f)+a[i1]*f)|0;}return o;}
 function pcm16ToMuLaw(a){const o=new Uint8Array(a.length);for(let i=0;i<a.length;i++){let s=a[i],sgn=(s>>8)&128;if(sgn)s=-s;if(s>MULAW_MAX)s=MULAW_MAX;s+=132;let e=7;for(let m=16384;(s&m)===0&&e>0;m>>=1)e--;const mnt=(s>>((e===0)?4:(e+3)))&15;o[i]=~(sgn|(e<<4)|mnt)&255;}return o;}
 const b64ToBytes=b=>Buffer.from(b,"base64"),bytesToB64=b=>Buffer.from(b).toString("base64");
 
@@ -63,7 +63,6 @@ function handleTwilio(wsTwilio){
   console.log("Twilio stream connected");
   let streamSid=null, openaiWS=null, open=true;
   let inResponse=false;          // true while model is speaking
-  let haveAudio=false;           // flip true after first caller audio frame
   let keepaliveTimer=null;
 
   const sendToTwilio = (ulaw) => {
@@ -88,9 +87,9 @@ function handleTwilio(wsTwilio){
         try{ wsTwilio?.send(JSON.stringify({event:"mark",streamSid,name:"tick"})); }catch{}
       },15000);
 
-      // OpenAI messages
+      // OpenAI messages (FIX: parse Buffer -> string)
       openaiWS.on("message",(raw)=>{
-        let p; try{ p=JSON.parse(raw); } catch { return; }
+        let p; try{ p = JSON.parse(raw.toString("utf8")); } catch { return; }
 
         if (p.type==="error"){ console.log("OpenAI ERROR:", JSON.stringify(p,null,2)); return; }
 
@@ -129,7 +128,6 @@ function handleTwilio(wsTwilio){
     }
 
     if (ev==="media" && openaiWS && openaiWS.readyState===WebSocket.OPEN){
-      haveAudio = true;
       const ulaw = b64ToBytes(d.media.payload);
       const pcm16_8k  = muLawToPCM16(ulaw);
       const pcm16_16k = linearResamplePCM16(pcm16_8k, 8000, 16000);
@@ -137,12 +135,10 @@ function handleTwilio(wsTwilio){
 
       // Append caller audio (no commit)
       openaiWS.send(JSON.stringify({ type:"input_audio_buffer.append", audio: bytesToB64(view) }));
-      // If you want “barge-in”, you could cancel current response on energy here (later).
     }
 
     if (ev==="stop"){
       console.log("Twilio stop");
-      // no commit on stop (avoids empty-buffer errors)
       wsTwilio.close();
     }
   });
