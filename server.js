@@ -5,7 +5,7 @@ import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 8080;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // project-scoped (long) key
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // project-scoped long key
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
 const VOICE          = process.env.VOICE || "verse";
 
@@ -21,7 +21,7 @@ Close with a clear next step (you’ll pass notes to Martin / arrange callback /
 // ───────── helpers ─────────
 const bytesToB64 = b => Buffer.from(b).toString("base64");
 const b64ToBytes = b => Buffer.from(b, "base64");
-// 20 ms μ-law @8 kHz (160 bytes) silence to keep Twilio’s stream alive
+// 20 ms μ-law @8 kHz (160 bytes) silence to keep Twilio alive
 const ULAW_SILENCE_20MS = new Uint8Array(160).fill(0xFF);
 
 // μ-law decode + simple 8k→16k resampler for caller audio into OpenAI
@@ -88,18 +88,20 @@ function handleTwilio(wsTwilio) {
   let inResponse = false;
   let sessionReady = false;
 
-  // ✅ CRUCIAL: label outbound audio with track:"outbound"
-  const sendToTwilio = (ulawBytes) => {
-    if (open && wsTwilio.readyState === WebSocket.OPEN) {
+  // ✅ CRUCIAL: outbound frames must be exactly 160 bytes (20 ms @ 8 kHz μ-law)
+  function sendUlawChunkedToTwilio(ulawBytes) {
+    if (!open || wsTwilio.readyState !== WebSocket.OPEN) return;
+    for (let i = 0; i + 160 <= ulawBytes.length; i += 160) {
+      const frame = ulawBytes.subarray(i, i + 160);
       wsTwilio.send(JSON.stringify({
         event: "media",
         streamSid,
-        track: "outbound", // <-- tell Twilio this audio goes to the caller
-        media: { payload: bytesToB64(ulawBytes) }
+        track: "outbound",               // tell Twilio this is to the caller
+        media: { payload: bytesToB64(frame) }
       }));
-      // console.log("🎧 to Twilio", ulawBytes.length, "bytes");
     }
-  };
+    // (Optional) handle tail < 160 bytes by buffering until next delta; Twilio prefers exact 160-byte frames.
+  }
 
   wsTwilio.on("message", async (msg) => {
     let data; try { data = JSON.parse(msg.toString("utf8")); } catch { return; }
@@ -119,7 +121,7 @@ function handleTwilio(wsTwilio) {
 
       // μ-law silence pump so Twilio doesn't bail before audio starts
       if (!silencePump) {
-        silencePump = setInterval(() => sendToTwilio(ULAW_SILENCE_20MS), 40);
+        silencePump = setInterval(() => sendUlawChunkedToTwilio(ULAW_SILENCE_20MS), 40);
       }
 
       // OpenAI messages
@@ -151,7 +153,7 @@ function handleTwilio(wsTwilio) {
             console.log("✔ OpenAI audio started");
           }
           const ulawBytes = Buffer.from(pkt.delta, "base64");
-          sendToTwilio(ulawBytes);
+          sendUlawChunkedToTwilio(ulawBytes); // ✅ chunk to 160-byte frames
         }
       });
 
