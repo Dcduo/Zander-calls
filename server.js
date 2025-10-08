@@ -88,9 +88,15 @@ function handleTwilio(wsTwilio) {
   let inResponse = false;
   let sessionReady = false;
 
+  // ✅ CRUCIAL: label outbound audio with track:"outbound"
   const sendToTwilio = (ulawBytes) => {
     if (open && wsTwilio.readyState === WebSocket.OPEN) {
-      wsTwilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: bytesToB64(ulawBytes) }}));
+      wsTwilio.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        track: "outbound", // <-- tell Twilio this audio goes to the caller
+        media: { payload: bytesToB64(ulawBytes) }
+      }));
       // console.log("🎧 to Twilio", ulawBytes.length, "bytes");
     }
   };
