@@ -1,36 +1,47 @@
 // server.js — Twilio Media Streams <-> OpenAI Realtime bridge + TwiML endpoint
-// Adds: detailed logging, OpenAI message dump, 100ms delay before first speak,
-// periodic commits, WS keepalives.
+// Node 20+, dependency: ws (npm i ws)
 
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 
+// ──────────── ENV ────────────
 const PORT = process.env.PORT || 8080;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // REQUIRED (project-scoped, long)
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
 const VOICE          = process.env.VOICE || "verse";
 
+// Persona / instructions
 const INSTRUCTIONS = `
 You are **Zander** from **MachineTrade**, calling on behalf of **Martin** at **MJ Woodworking**.
 Purpose: Martin is flat-out today; you're gathering quick details and answering immediate questions.
-Style: warm, brief, conversational. Collect budget, location, intended use, and handle quick spec questions.
-No transfers. Close with a clear next step (you’ll pass notes to Martin / arrange callback / send quote outline).
+Style: warm, brief, truly conversational. Allow interruptions and acknowledge them.
+Collect (adapt order; skip if covered):
+• Budget (rough range)
+• Location / delivery postcode
+• Intended use: what they'll make; materials, sizes, throughput; special requirements
+• Quick spec questions (power, capacity, compatible materials, throughput, warranty). If unsure, promise a quick follow-up.
+Confirm key details back; gently steer if off track. No transfers.
+Close with a clear next step (you'll pass notes to Martin / arrange callback / send quote outline).
 `;
 
-// ---- μ-law helpers ----
+// ──────────── μ-law helpers ────────────
 const MULAW_MAX = 0x1FFF, SIGN_BIT = 0x80, QUANT_MASK = 0x0F, SEG_SHIFT = 4, SEG_MASK = 0x70;
 function ulawDecode(sample){sample=~sample&0xFF;let t=((sample&QUANT_MASK)<<3)+0x84;t<<=((sample&SEG_MASK)>>>SEG_SHIFT);return((sample&SIGN_BIT)?(0x84-t):(t-0x84))}
 function muLawToPCM16(ulaw){const out=new Int16Array(ulaw.length);for(let i=0;i<ulaw.length;i++)out[i]=ulawDecode(ulaw[i]);return out}
 function linearResamplePCM16(int16,inRate,outRate){
   if(inRate===outRate) return int16;
   const ratio = outRate/inRate, outLen = Math.floor(int16.length*ratio), out = new Int16Array(outLen);
-  for (let i=0;i<outLen;i++){const src=i/ratio, i0=Math.floor(src), i1=Math.min(i0+1,int16.length-1), f=src-i0; out[i]=(int16[i0]*(1-f)+int16[i1]*f)|0;}
+  for (let i=0;i<outLen;i++){
+    const src=i/ratio, i0=Math.floor(src), i1=Math.min(i0+1,int16.length-1), f=src-i0;
+    out[i]=(int16[i0]*(1-f)+int16[i1]*f)|0;
+  }
   return out;
 }
 function pcm16ToMuLaw(int16){
   const out = new Uint8Array(int16.length);
   for (let i=0;i<int16.length;i++){
-    let s=int16[i], sign=(s>>8)&0x80; if(sign) s=-s; if(s>MULAW_MAX) s=MULAW_MAX; s+=0x84;
+    let s=int16[i], sign=(s>>8)&0x80; if(sign) s=-s;
+    if (s>MULAW_MAX) s=MULAW_MAX; s+=0x84;
     let exponent=7; for(let m=0x4000;(s&m)===0 && exponent>0; m>>=1) exponent--;
     const mantissa=(s>>((exponent===0)?4:(exponent+3)))&0x0F;
     out[i]=~(sign|(exponent<<4)|mantissa)&0xFF;
@@ -40,9 +51,10 @@ function pcm16ToMuLaw(int16){
 const b64ToBytes = b64 => Buffer.from(b64, "base64");
 const bytesToB64 = bytes => Buffer.from(bytes).toString("base64");
 
-// ---- HTTP: TwiML endpoint ----
+// ──────────── HTTP (serves TwiML) ────────────
 const server = http.createServer((req, res) => {
   if (req.url.startsWith("/twiml")) {
+    // IMPORTANT: text/xml + both_tracks so we can send audio back
     res.writeHead(200, { "content-type": "text/xml" });
     const host = req.headers.host;
     res.end(`
@@ -54,11 +66,12 @@ const server = http.createServer((req, res) => {
 </Response>`.trim());
     return;
   }
+  // Simple health check
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK");
 });
 
-// ---- WS bridge: /ws/twilio ----
+// ──────────── WebSocket bridge (/ws/twilio) ────────────
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url.startsWith("/ws/twilio")) {
@@ -88,29 +101,31 @@ function handleTwilio(wsTwilio) {
   let openaiWS = null;
   let open = true;
 
-  let framesSinceCommit = 0;
-  const COMMIT_EVERY_FRAMES = 5; // ~100ms (5 x 20ms)
+  let framesSinceCommit = 0;           // commit roughly every ~100 ms (5 * 20 ms)
+  const COMMIT_EVERY_FRAMES = 5;
   let keepaliveTimer = null;
 
   function sendToTwilio(mutlaw) {
     if (!open || wsTwilio.readyState !== WebSocket.OPEN) return;
-    wsTwilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: bytesToB64(mutlaw) }}));
+    wsTwilio.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: bytesToB64(mutlaw) }
+    }));
   }
 
   wsTwilio.on("message", async (msg) => {
-    const txt = msg.toString("utf8");
-    let data; try { data = JSON.parse(txt); } catch { return; }
+    let data;
+    try { data = JSON.parse(msg.toString("utf8")); } catch { return; }
     const event = data.event;
 
-    if (event === "connected") {
-      console.log("Twilio event: connected");
-    }
+    if (event === "connected") console.log("Twilio event: connected");
 
     if (event === "start") {
       streamSid = data.start.streamSid;
       console.log("Twilio start", streamSid, "tracks:", data.start.tracks);
 
-      // OpenAI connect
+      // Connect to OpenAI Realtime
       openaiWS = await connectOpenAI();
 
       // Keepalive (avoid idle closes)
@@ -119,26 +134,37 @@ function handleTwilio(wsTwilio) {
         try { wsTwilio?.send(JSON.stringify({ event: "mark", streamSid, name: "tick" })); } catch {}
       }, 15000);
 
-      // Log ALL messages from OpenAI so we can see what's happening
+      // Handle ALL messages from OpenAI
       openaiWS.on("message", (raw) => {
         let pkt; try { pkt = JSON.parse(raw.toString("utf8")); } catch { return; }
-        if (pkt.type === "output_audio.delta") {
-          const samples = Buffer.from(pkt.delta, "base64").length / 2; // 2 bytes per int16
-          const pcm16_16k = new Int16Array(Buffer.from(pkt.delta, "base64").buffer);
+
+        // 🔎 print full error payloads
+        if (pkt.type === "error" || pkt.type?.endsWith?.(".error")) {
+          console.log("OpenAI ERROR:", JSON.stringify(pkt, null, 2));
+          return;
+        }
+
+        if (pkt.type === "output_audio.delta" && pkt.delta) {
+          const b = Buffer.from(pkt.delta, "base64");
+          const pcm16_16k = new Int16Array(b.buffer, b.byteOffset, b.byteLength / 2);
           const pcm16_8k  = linearResamplePCM16(pcm16_16k, 16000, 8000);
           const ulaw8k    = pcm16ToMuLaw(pcm16_8k);
           sendToTwilio(ulaw8k);
-          console.log(`OpenAI → audio delta: ${samples} samples, sent ${ulaw8k.length} ulaw`);
-        } else {
-          // helpful for debugging: see interim transcripts, statuses, errors
-          console.log("OpenAI msg:", pkt.type);
+          // console.log(`OpenAI → audio delta: ${ulaw8k.length} ulaw samples`);
+          return;
         }
+
+        // Helpful to see flow (response.created, response.output_text.delta, etc.)
+        console.log("OpenAI msg:", pkt.type);
       });
 
       openaiWS.on("close", (c, r) => console.log("OpenAI WS closed", c, r?.toString?.()));
 
       // Configure the session
-      openaiWS.send(JSON.stringify({ type: "session.update", session: { voice: VOICE, instructions: INSTRUCTIONS }}));
+      openaiWS.send(JSON.stringify({
+        type: "session.update",
+        session: { voice: VOICE, instructions: INSTRUCTIONS }
+      }));
 
       // Small delay helps some hosts avoid immediate stop before first audio frame
       setTimeout(() => {
@@ -150,16 +176,21 @@ function handleTwilio(wsTwilio) {
       }, 100); // 100ms
     }
 
+    // Caller audio from Twilio (8 kHz μ-law)
     if (event === "media" && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
       const ulawBytes = b64ToBytes(data.media.payload);
       const pcm16_8k  = muLawToPCM16(ulawBytes);
       const pcm16_16k = linearResamplePCM16(pcm16_8k, 8000, 16000);
 
+      // ✅ encode only the Int16 view (avoid base64 length errors)
+      const viewBuf = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength);
       openaiWS.send(JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: bytesToB64(Buffer.from(pcm16_16k.buffer))
+        audio: bytesToB64(viewBuf)
       }));
       framesSinceCommit++;
+
+      // Commit periodically so the model reacts quickly
       if (framesSinceCommit >= COMMIT_EVERY_FRAMES) {
         openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
         openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] }}));
@@ -167,10 +198,16 @@ function handleTwilio(wsTwilio) {
       }
     }
 
-    if (event === "stop") {
-      console.log("Twilio stop");
-      try { openaiWS?.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
-      wsTwilio.close();
+    // End/DTMF: force a commit
+    if (event === "stop" || event === "dtmf") {
+      if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] }}));
+      }
+      if (event === "stop") {
+        console.log("Twilio stop");
+        wsTwilio.close();
+      }
     }
   });
 
