@@ -100,7 +100,7 @@ function handleTwilio(wsTwilio){
             voice: VOICE,
             instructions: INSTRUCTIONS,
             input_audio_format:  "pcm16",
-            output_audio_format: "pcm16"
+            output_audio_format: "g711_ulaw"
           }
 }));
 
@@ -175,5 +175,6 @@ function handleTwilio(wsTwilio){
     try { openaiWS?.close(); } catch {}
   });
 }
+
 
 
