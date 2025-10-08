@@ -94,15 +94,15 @@ function handleTwilio(wsTwilio){
       }, 15000);
 
       // Tell Realtime which audio formats we use (PCM16 @16k)
-      openaiWS.send(JSON.stringify({
-        type: "session.update",
-        session: {
-          voice: VOICE,
-          instructions: INSTRUCTIONS,
-          input_audio_format:  { type: "pcm16", sample_rate_hz: 16000 },
-          output_audio_format: { type: "pcm16", sample_rate_hz: 16000 }
-        }
-      }));
+        openaiWS.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            voice: VOICE,
+            instructions: INSTRUCTIONS,
+            input_audio_format:  "pcm16",
+            output_audio_format: "pcm16"
+          }
+}));
 
       // Start a “silence pump” so Twilio doesn't hang up before first audio
       if (!silencePump) {
@@ -174,3 +174,4 @@ function handleTwilio(wsTwilio){
     try { openaiWS?.close(); } catch {}
   });
 }
+
