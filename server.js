@@ -43,7 +43,7 @@ function muLawToPCM16(buf){ const o=new Int16Array(buf.length); for(let i=0;i<bu
 function linearResamplePCM16(a,fi,fo){ if(fi===fo)return a; const r=fo/fi, o=new Int16Array(Math.floor(a.length*r));
   for(let i=0;i<o.length;i++){ const s=i/r, i0=Math.floor(s), i1=Math.min(i0+1,a.length-1), f=s-i0; o[i]=(a[i0]*(1-f)+a[i1]*f)|0; } return o; }
 
-// TwiML (kept for quick sanity checks—won’t be used when you point number at TwiML Bin)
+// TwiML (kept for quick sanity checks—this won’t be used when you point number at TwiML Bin)
 const server = http.createServer((req,res)=>{
   if (req.url.startsWith("/twiml")) {
     res.writeHead(200, {"content-type":"text/xml"});
@@ -177,3 +177,4 @@ function handleTwilio(wsTwilio){
     try { openaiWS?.close(); } catch {}
   });
 }
+
